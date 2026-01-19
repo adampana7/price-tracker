@@ -22,25 +22,23 @@ async function scrapeCostcoProduct(page, url) {
   try {
     console.log(`Scraping: ${url}`);
 
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+    // Navigate and wait for network to be mostly idle
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Wait longer for dynamic content to load
-    await page.waitForFunction(() => {
-      // Wait until we find some price-like content on the page
-      const bodyText = document.body.innerText;
-      return bodyText.includes('$') || bodyText.includes('CAD');
-    }, { timeout: 15000 });
+    // Wait for the page to settle
+    await new Promise(resolve => setTimeout(resolve, 5000));
 
-    // Additional wait for JavaScript rendering
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    // Get the page content for debugging
+    const pageContent = await page.content();
+    const hasPrice = pageContent.includes('$') || pageContent.includes('price');
+    console.log(`  Page has price indicators: ${hasPrice}`);
+    console.log(`  Page length: ${pageContent.length} chars`);
 
     const data = await page.evaluate(() => {
-      // Debug: log what we find
       const debugInfo = [];
 
-      // Costco.ca specific selectors - try multiple patterns
+      // Costco.ca specific selectors
       const priceSelectors = [
-        // Costco specific
         '.your-price .value',
         '.your-price',
         '#pull-right-price .value',
@@ -48,19 +46,13 @@ async function scrapeCostcoProduct(page, url) {
         '.price-value',
         '.sale-price',
         '.promo-price',
-        '[data-testid="price"]',
-        // Common e-commerce patterns
         '.current-price',
         '.final-price',
         '.product-price',
         '.price .value',
         '.price-sales',
         '.offer-price',
-        // Generic fallbacks
-        '[class*="sale"][class*="price"]',
-        '[class*="your"][class*="price"]',
-        '[class*="final"][class*="price"]',
-        '[class*="current"][class*="price"]',
+        '[class*="price"]',
       ];
 
       let priceText = null;
@@ -68,59 +60,58 @@ async function scrapeCostcoProduct(page, url) {
 
       for (const selector of priceSelectors) {
         try {
-          const el = document.querySelector(selector);
-          if (el) {
+          const elements = document.querySelectorAll(selector);
+          for (const el of elements) {
             const text = el.textContent.trim();
-            debugInfo.push(`${selector}: "${text}"`);
-            if (text && text.includes('$')) {
-              priceText = text;
-              usedSelector = selector;
-              break;
+            if (text && /\$[\d,]+\.\d{2}/.test(text)) {
+              debugInfo.push(`${selector}: "${text.substring(0, 50)}"`);
+              if (!priceText) {
+                priceText = text;
+                usedSelector = selector;
+              }
             }
           }
         } catch (e) {
-          // Selector might be invalid, continue
+          // Continue
         }
       }
 
-      // If still no price, try to find any element with a price pattern
+      // Fallback: scan all text nodes for price pattern
       if (!priceText) {
-        const allElements = document.querySelectorAll('*');
-        for (const el of allElements) {
-          if (el.children.length === 0) { // leaf nodes only
-            const text = el.textContent.trim();
-            // Look for Canadian dollar format: $1,234.56
-            if (/^\$[\d,]+\.\d{2}$/.test(text)) {
-              const price = parseFloat(text.replace(/[$,]/g, ''));
-              // Reasonable price range for Costco products
-              if (price > 0 && price < 100000) {
-                debugInfo.push(`Found price in leaf node: "${text}"`);
-                if (!priceText) {
-                  priceText = text;
-                  usedSelector = 'leaf-node-scan';
-                }
-              }
+        const walker = document.createTreeWalker(
+          document.body,
+          NodeFilter.SHOW_TEXT,
+          null,
+          false
+        );
+
+        let node;
+        while ((node = walker.nextNode())) {
+          const text = node.textContent.trim();
+          const match = text.match(/\$[\d,]+\.\d{2}/);
+          if (match) {
+            debugInfo.push(`TextNode: "${text.substring(0, 50)}"`);
+            if (!priceText) {
+              priceText = match[0];
+              usedSelector = 'text-node-scan';
             }
           }
         }
       }
 
       // Get title
-      const titleSelectors = ['h1', '.product-title', '.product-name', '[data-testid="product-title"]'];
       let title = null;
-      for (const selector of titleSelectors) {
-        const el = document.querySelector(selector);
-        if (el && el.textContent) {
-          title = el.textContent.trim();
-          break;
-        }
+      const h1 = document.querySelector('h1');
+      if (h1) {
+        title = h1.textContent.trim();
       }
 
       return {
         priceText,
         title,
         usedSelector,
-        debug: debugInfo.slice(0, 10) // Limit debug output
+        debug: debugInfo.slice(0, 15),
+        bodyText: document.body.innerText.substring(0, 500)
       };
     });
 
@@ -128,16 +119,18 @@ async function scrapeCostcoProduct(page, url) {
     console.log(`  Price text: ${data.priceText || 'not found'}`);
     console.log(`  Used selector: ${data.usedSelector || 'none'}`);
     if (data.debug && data.debug.length > 0) {
-      console.log(`  Debug: ${data.debug.join(', ')}`);
+      console.log(`  Debug selectors found: ${data.debug.length}`);
+      data.debug.forEach(d => console.log(`    - ${d}`));
+    }
+    if (!data.priceText) {
+      console.log(`  Body preview: ${data.bodyText.substring(0, 200)}...`);
     }
 
     if (!data.priceText) {
-      // Take a screenshot for debugging
-      await page.screenshot({ path: '/tmp/debug-screenshot.png', fullPage: false });
       throw new Error('Price not found on page');
     }
 
-    // Parse price from text like "$1,399.99" or "1,399.99"
+    // Parse price
     const priceMatch = data.priceText.match(/[\d,]+\.\d{2}/);
     if (!priceMatch) {
       throw new Error(`Could not parse price from: ${data.priceText}`);
@@ -215,24 +208,26 @@ async function main() {
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--disable-gpu',
+      '--disable-blink-features=AutomationControlled',
     ],
   });
 
   const page = await browser.newPage();
 
-  // Set viewport
+  // Make it look less like a bot
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+  });
+
   await page.setViewport({ width: 1920, height: 1080 });
 
-  // Set a realistic user agent
   await page.setUserAgent(
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
   );
 
-  // Set extra headers
   await page.setExtraHTTPHeaders({
     'Accept-Language': 'en-CA,en;q=0.9',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
   });
 
   const results = [];
@@ -240,9 +235,7 @@ async function main() {
   for (const product of products) {
     const result = await scrapeCostcoProduct(page, product.url);
     results.push(result);
-
-    // Add a small delay between requests
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    await new Promise(resolve => setTimeout(resolve, 3000));
   }
 
   await browser.close();
