@@ -1,0 +1,29 @@
+name: Update Prices
+
+on:
+  schedule:
+    # Run daily at midnight UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install puppeteer
+
+      - name: Run price scraper
+        env:
+          API_URL: ${{ secrets.API_URL }}
+          UPDATE_PRICES_SECRET: ${{ secrets.UPDATE_PRICES_SECRET }}
+        run: node scripts/scrape-prices.js
